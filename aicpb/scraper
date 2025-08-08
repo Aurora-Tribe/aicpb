@@ -1,0 +1,513 @@
+import asyncio
+import traceback
+import random
+import os
+import json
+import re
+import logging
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from utils.logger_service import logger
+from lxml import etree
+
+COOKIES = [
+  {
+    "name": "GMITM_lang",
+    "value": "zh-Hans",
+    "domain": ".3ue.co",
+    "path": "/",
+    "expires": 1757223668,
+    "httpOnly": False,
+    "secure": False,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "GMITM_token",
+    "value": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJ1bmFtZSI6ImNhbWNhbSIsInBlcm1pc3Npb25zIjpbInNlbXJ1c2guZ3VydSIsInNpbWlsYXJ3ZWIiLCJ1c2VyIl0sImlhdCI6MTc1NDYzMTY2NCwiZXhwIjoxNzU0ODkwODY0fQ.lpHkm5GYYRa4LU3QNE8ejNe4rHuGWQ1Re1xl2sO6Nj_L0FOyY9yOYo5MpPf3L841pmY_Qn0_eiMQ2eT0GgEnDhYepAJRfo4kWLLHrwwUx3AUnJhOckhX8XJ6gLF1g1nY_kb0uD956iAOA7qhqVqiYgfOVQew-ErZrf55DHhab_XUeqYn1VKpDcH_NgwA1ezl5NAjDA5ZwlkctQUHwnCcIZYFchvKufAUv-hBps7OEOO3P9QHrksvLhusAwOESE0H2Q5N7dEJ3UJvH6-mWjiGlwhqIs6VVz_57NuG3eBibx79ce1cNzGFI876eAdowdriR5wLVyY59wYHj7M-HIUrfQ",
+    "domain": ".3ue.co",
+    "path": "/",
+    "expires": 1754890865.95629,
+    "httpOnly": False,
+    "secure": True,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "GMITM_uname",
+    "value": "camcam",
+    "domain": ".3ue.co",
+    "path": "/",
+    "expires": 1754890865.956317,
+    "httpOnly": False,
+    "secure": True,
+    "sameSite": "Lax"
+  }
+]
+
+SIMWEB_BASE = 'https://sim.3ue.co/#/digitalsuite/websiteanalysis/overview/website-performance/*/999/3m?webSource=Total'
+LOGIN_URL = 'https://dash.3ue.co/zh-Hans/#/login'
+SIMWEB_BASE_TRAFFIC = 'https://sim.3ue.co/#/digitalsuite/websiteanalysis/traffic-engagement/*/999/3m/?webSource=Total'
+
+class SimwebPlaywrightScraper():
+    """
+    A class to scrape data from Similarweb using Playwright.
+    This class handles authenticated sessions via cookies and saves the full page content.
+    """
+    def __init__(
+        self,
+        headlessState='yes',
+        topic=None,
+        target_url=None,
+        proxy=None,
+        playwright=None,
+        browser=None,
+        context=None,
+        page=None,
+        max_retries=3
+    ):
+        """
+        Initialize the Simweb Scraper with scraping preferences.
+        """
+        self.headlessState = headlessState
+        
+        # 根据 topic 或 target_url 设置最终的 URL
+        if not target_url and topic:
+            self.target_url = SIMWEB_BASE_TRAFFIC + f'&key={topic}' 
+        else:
+            self.target_url = target_url
+            
+        self.scraper_details = {
+            "type": "General Webpage",
+            "topic": topic,
+            "target_url": self.target_url,
+        }
+        
+        self.playwright = playwright
+        self.browser = browser
+        self.context = context
+        self.page = page
+        self.proxy = proxy
+        self.cookies = COOKIES
+        self.username = 'camcam'
+        self.password = 'Cam12138'
+        self.max_retries = max_retries
+
+    def parse_html_to_json(self, html_content):
+        """
+        Parses the provided HTML content and extracts specific data to format as a JSON object.
+
+        Args:
+            html_content (str): A string containing the HTML to be parsed.
+
+        Returns:
+            str: A JSON formatted string with the extracted data.
+        """
+        root = etree.fromstring(html_content, etree.HTMLParser())
+        # Helper function to convert 'M' values to numbers
+        def parse_value(value_str):
+            if 'M' in value_str:
+                return int(float(value_str.replace('M', '')) * 1000000)
+            # Attempt to convert to float, then to int if it's a whole number
+            try:
+                val = float(value_str)
+                return int(val) if val.is_integer() else val
+            except ValueError:
+                return value_str
+        
+        # ---
+        
+        # 提取月份范围，使用父级稳定的类名定位
+        month_xpath = "string(//div[contains(@class, 'IconItem')])"
+        month_text = root.xpath(month_xpath).strip() if root.xpath(month_xpath) else None
+
+        # 提取总访问量，通过其标题“每月访问量”来间接定位其父级
+        # 假设总访问量在整个HTML中是唯一的，并且有一个明确的父级来定位
+        # 我们可以通过其兄弟节点来定位
+        total_visits_xpath = "//div[contains(@class, 'TotalNumberStyled') and contains(@class, 'iWIKtL')]/text()"
+        total_visits_text = root.xpath(total_visits_xpath)
+        total_visits = parse_value(total_visits_text[0].strip()) if total_visits_text else None
+    
+        # ---
+
+        # 提取流量卡片的值，使用稳定的 `data-automation` 属性
+        traffic_tabs = root.xpath("//li[.//div[@data-automation='tab-title']]")
+
+        average_daily_uniques = None
+        unique_audience_deduplicated = None
+
+        for tab in traffic_tabs:
+            title = tab.xpath(".//div[@data-automation='tab-title']/text()")
+            value = tab.xpath(".//div[@data-automation='tab-value']/text()")
+            if title and value:
+                title = title[0].strip()
+                value = value[0].strip()
+                if "每月访问量" in title:
+                    average_daily_uniques = parse_value(value)
+                elif "独立访客" in title:
+                    # 独立访客在您的原始JSON中没有对应，但为了完整性，可以提取
+                    pass
+                elif "已消除重叠的受众" in title:
+                    unique_audience_deduplicated = parse_value(value)
+
+        # ---
+
+        # 提取互动卡片的值，同样使用稳定的 `data-automation` 属性
+        average_visit_duration = None
+        pages_per_visit = None
+        bounce_rate = None
+        page_views = None
+
+        for tab in traffic_tabs:
+            title = tab.xpath(".//div[@data-automation='tab-title']/text()")
+            value = tab.xpath(".//div[@data-automation='tab-value']/text()")
+            if title and value:
+                title = title[0].strip()
+                value = value[0].strip()
+                if "平均访问停留时间" in title:
+                    average_visit_duration = value
+                elif "每次访问页数" in title:
+                    pages_per_visit = parse_value(value)
+                elif "跳出率" in title:
+                    bounce_rate = value
+                elif "页面浏览量" in title:
+                    page_views = parse_value(value)
+
+        # Construct the final JSON object
+        data = {
+            "platform": self.topic,
+            "month": month_text,
+            "traffic": {
+                "total_visits": total_visits,
+                "average_daily_uniques": average_daily_uniques,
+                "unique_audience_deduplicated": unique_audience_deduplicated
+            },
+            "engagement": {
+                "average_visit_duration": average_visit_duration,
+                "pages_per_visit": pages_per_visit,
+                "bounce_rate": bounce_rate,
+                "page_views": page_views
+            }
+        }
+
+        return data
+    async def go_to_page(self, target_url=None, timeout=30000):
+        """
+        Navigate to the target URL on Similarweb.
+        """
+        if target_url:
+            self.target_url = target_url
+            
+        if self.target_url is None:
+            logger.error("Target URL is not set.")
+            return
+        
+        logger.debug(f"Visiting {self.target_url}...")
+        await self.page.goto(self.target_url, timeout=timeout)
+        # 等待页面加载，这里延长了等待时间以确保页面内容完整加载
+        await asyncio.sleep(random.uniform(3, 5)) 
+
+    async def get_page_content(self):
+        """
+        获取当前页面的完整 HTML，按结构解析并保存 JSON。
+        """
+        logger.info("获取页面 HTML 并开始解析...")
+        html_content = await self.page.content()
+
+        # 可选：保留原始 HTML 以便排查
+        try:
+            with open("page_raw.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+        except Exception:
+            pass
+
+        # 解析 HTML 数据
+        parsed_data = self.parse_html_to_json(html_content)
+        
+        # 确保返回的是字典格式，而不是JSON字符串
+        if isinstance(parsed_data, str):
+            try:
+                parsed_data = json.loads(parsed_data)
+            except json.JSONDecodeError:
+                logger.error("解析JSON字符串失败")
+                parsed_data = {}
+
+        # 保存解析后的数据到 JSON 文件
+        try:
+            with open("parsed_data.json", "w", encoding="utf-8") as f:
+                json.dump(parsed_data, f, indent=2, ensure_ascii=False)
+            logger.info("数据已解析并保存到 parsed_data.json")
+        except Exception as e:
+            logger.error(f"保存JSON文件失败: {e}")
+
+        return parsed_data
+    
+    async def check_login_status(self):
+        """
+        检查当前页面是否已登录
+        """
+        current_url = self.page.url
+        logger.debug(f"当前URL: {current_url}")
+        
+        # 如果URL包含登录页面，说明未登录
+        if 'login' in current_url.lower():
+            return False
+        
+        # 如果URL包含登录相关的关键词，认为已登录
+        if any(keyword in current_url.lower() for keyword in ['home', 'dashboard', 'page', 'digitalsuite']):
+            return True
+            
+        # 检查页面内容中是否有登录相关的元素
+        try:
+            # 检查是否存在登录表单
+            login_form = await self.page.query_selector('#input-username')
+            if login_form:
+                return False
+        except:
+            pass
+            
+        return True
+
+    async def login_with_credentials(self, username, password):
+        """
+        Log in using username and password.
+        """
+        logger.debug(f"Attempting to log in with user: {username}...")
+        
+        # 导航到登录页面
+        await self.page.goto(LOGIN_URL)
+        
+        # 等待用户名和密码输入框出现
+        await self.page.wait_for_selector('#input-username')
+        await self.page.wait_for_selector('#input-password')
+        
+        # 填充用户名和密码
+        await self.page.fill('#input-username', username)
+        await self.page.fill('#input-password', password)
+        
+        # 点击登录按钮
+        await self.page.click('button:has-text("登录")')
+        
+        logger.debug("Login button clicked. Waiting for navigation...")
+        
+        # 等待页面导航，支持多种可能的登录后URL
+        try:
+            # 尝试等待多种可能的登录后URL
+            await self.page.wait_for_url('**/page/m/home**', timeout=10000)
+            logger.debug("Login successful - navigated to home page")
+        except:
+            try:
+                await self.page.wait_for_url('**/dashboard**', timeout=10000)
+                logger.debug("Login successful - navigated to dashboard")
+            except:
+                # 如果所有URL都不匹配，等待一段时间让页面加载完成
+                logger.debug("Waiting for page to load after login...")
+                await asyncio.sleep(5)
+                
+                # 检查当前URL
+                current_url = self.page.url
+                logger.debug(f"Current URL after login: {current_url}")
+                
+                # 如果URL包含登录相关的关键词，认为登录成功
+                if any(keyword in current_url.lower() for keyword in ['home', 'dashboard', 'page']):
+                    logger.debug("Login appears successful based on URL")
+                else:
+                    logger.debug("Login status unclear, but proceeding...")
+        
+        # 等待页面完全加载
+        await asyncio.sleep(3)
+        
+        # 检查登录状态
+        if await self.check_login_status():
+            logger.debug("Login process completed successfully.")
+        else:
+            logger.debug("Login failed - redirected back to login page")
+            raise Exception("Login failed")
+        
+        logger.debug("Login process completed.")
+        self.cookies = await self.context.cookies()
+
+    # async def save_cookies_to_file(self, filename="saved_cookies.json"):
+    #     """
+    #     登录后保存cookies到文件
+    #     """        
+    #     async with async_playwright() as p:
+    #         self.playwright = p
+    #         self.browser = await p.chromium.launch(headless=self.headlessState == 'yes')
+    #         self.context = await self.browser.new_context()
+    #         self.page = await self.context.new_page()
+
+    #         try:
+    #             # 登录
+    #             await self.login_with_credentials('camcam', 'Cam12138')
+                
+    #             # 获取所有cookies
+    #             cookies = await self.context.cookies()
+    #             print(f"获取到 {len(cookies)} 个cookies")
+                
+    #             # 保存cookies到文件
+    #             with open(filename, 'w', encoding='utf-8') as f:
+    #                 json.dump(cookies, f, indent=2, ensure_ascii=False)
+    #             print(f"Cookies已保存到 {filename}")
+                
+    #             # 测试使用保存的cookies直接访问目标URL
+    #             await self.login_with_cookies(filename)
+                
+    #         except Exception as e:
+    #             print(f"保存cookies时出错: {traceback.format_exc()}")
+    #         finally:
+    #             if self.browser:
+    #                 await self.page.close()
+    #                 await self.context.close()
+    #                 await self.browser.close()
+
+    # async def login_with_cookies(self, cookies_file="saved_cookies.json"):
+    #     """
+    #     使用保存的cookies直接登录目标URL
+    #     """
+    #     print("=== 使用保存的cookies直接登录 ===")
+    
+            
+    #     async with async_playwright() as p:
+    #         self.playwright = p
+    #         self.browser = await p.chromium.launch(headless=self.headlessState == 'yes')
+    #         self.context = await self.browser.new_context()
+    #         self.page = await self.context.new_page()
+    #         # 加载cookies
+    #         # with open(cookies_file, 'r', encoding='utf-8') as f:
+    #         #     cookies = json.load(f)
+    #         cookies = COOKIES
+    #         # 设置cookies
+    #         await self.context.add_cookies(cookies)
+
+
+    async def scrape_data(self):
+        """
+        Scrape and save the full page HTML content.
+        """
+        # 使用 async_playwright 启动浏览器
+        for i in range(self.max_retries):
+            parsed_data = {}
+            async with async_playwright() as p:
+                self.playwright = p
+                self.browser = await p.chromium.launch(headless=self.headlessState == 'yes')
+                self.context = await self.browser.new_context()
+                self.page = await self.context.new_page()
+
+                try:
+                    await self.login_with_credentials(self.username, self.password)
+                    await self.go_to_page(timeout=60000)
+                    await asyncio.sleep(random.uniform(10, 15)) 
+                    parsed_data = await self.get_page_content()
+                    # # 首先尝试使用cookies登录
+                    # logger.debug("尝试使用cookies登录...")
+                    # await self.context.add_cookies(self.cookies)
+                    # await self.go_to_page(timeout=60000)
+                    
+                    # # 检查是否成功访问目标页面
+                    # if await self.check_login_status():
+                    #     logger.debug("Cookies登录成功")
+                    #     await asyncio.sleep(random.uniform(10, 15)) 
+                    #     parsed_data = await self.get_page_content()
+                    # else:
+                    #     logger.info("Cookies登录失败，尝试用户名密码登录...")
+                    #     # 如果cookies失败，尝试用户名密码登录
+                    #     await self.login_with_credentials(self.username, self.password)
+                    #     await self.go_to_page(timeout=60000)
+                    #     await asyncio.sleep(random.uniform(10, 15)) 
+                    #     parsed_data = await self.get_page_content()
+                    break
+                except Exception as e:
+                    logger.error(f"An error occurred: {traceback.format_exc()}")
+                finally:
+                    # 关闭浏览器
+                    if self.browser:
+                        await self.page.close()
+                        await self.context.close()
+                        await self.browser.close()
+            logger.error(f"ERROR! Retries: {i}")
+        return parsed_data
+        
+    async def scrape_data_list(self, target_urls):
+        """
+        Scrape and save the full page HTML content.
+        """
+        # 使用 async_playwright 启动浏览器
+        parsed_data = {}
+        async with async_playwright() as p:
+            self.playwright = p
+            self.browser = await p.chromium.launch(headless=self.headlessState == 'yes')
+            self.context = await self.browser.new_context()
+            self.page = await self.context.new_page()
+            try:
+                # 首先尝试使用cookies登录
+                for target_url in target_urls:
+                    logger.debug("尝试使用cookies登录...")
+                    await self.context.add_cookies(self.cookies)
+                    await self.go_to_page(target_url,timeout=60000)
+                    
+                    # 检查是否成功访问目标页面
+                    if await self.check_login_status():
+                        logger.debug("Cookies登录成功")
+                        await asyncio.sleep(random.uniform(10, 15)) 
+                        parsed_data.update({target_url: await self.get_page_content()})
+                    else:
+                        logger.info("Cookies登录失败，尝试用户名密码登录...")
+                        # 如果cookies失败，尝试用户名密码登录
+                        await self.login_with_credentials(self.username, self.password)
+                        await self.go_to_page(target_url,timeout=60000)
+                        await asyncio.sleep(random.uniform(10, 15)) 
+                        parsed_data.update({target_url: await self.get_page_content()})
+                    
+            except Exception as e:
+                logger.error(f"An error occurred: {traceback.format_exc()}")
+            finally:
+                # 关闭浏览器
+                if self.browser:
+                    await self.page.close()
+                    await self.context.close()
+                    await self.browser.close()
+        return parsed_data
+
+
+async def main():
+    # 实例化您的爬虫类，并提供 topic 或目标 URL
+    import sys
+    import json
+    from datetime import datetime
+    
+    # 从命令行参数或stdin获取topic
+    topic = 'viggle.ai'  # 默认值
+    if len(sys.argv) > 1:
+        topic = sys.argv[1]
+    else:
+        # 尝试从stdin读取
+        try:
+            input_data = sys.stdin.read().strip()
+            if input_data:
+                topic = input_data
+        except:
+            pass
+    
+    begin = datetime.now()
+    scraper = SimwebPlaywrightScraper(topic=topic, headlessState='yes')  # 使用headless模式
+    data = await scraper.scrape_data()
+    end = datetime.now()
+    print(f"开始时间: {begin}, 结束时间: {end}, 耗时: {end - begin}")
+    
+    # 将数据保存到JSON文件供后端读取
+    try:
+        with open('parsed_data.json', 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print("数据已保存到 parsed_data.json")
+    except Exception as e:
+        print(f"保存JSON文件失败: {e}")
+    
+    print(data)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    # with open('credentials_success.html', 'r', encoding='utf-8') as f:
+    #     html_content = f.read()
+    # scraper = SimwebPlaywrightScraper()
+    # data = scraper.parse_html_data(html_content)
+    # print(data)
